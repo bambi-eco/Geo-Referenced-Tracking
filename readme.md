@@ -42,22 +42,12 @@ if embs_path.exists():
 else:
     embs = None
 
-# --- prepare combined array like in your full script ---------------------------
-# order: [dets | geo_dets | embs]
-dets_n_geo_n_embs = np.concatenate((dets, geo_dets, embs), axis=1)
-
-
 # --- pick one frame and slice its data ----------------------------------------
 frame_num = 1
 frame_num_padded = f"{frame_num:08d}"
 
 # select rows belonging to this frame
 frame_rows = dets_n_geo_n_embs[dets_n_geo_n_embs[:, 0] == int(frame_num_padded)]
-
-# same column layout as in generate_mot_results()
-dets_frame     = frame_rows[:, 1:7]    # [x, y, w, h, score, class_id]
-geo_dets_frame = frame_rows[:, 7:17]   # [frame_idx, geo_x, geo_y, ...] (10 cols)
-embs_frame     = frame_rows[:, 17:]    # embeddings
 
 # --- load image -------------------------------------
 if img_path.exists():
@@ -74,11 +64,11 @@ tracker = GeoHybridDeepOcSort()
 
 # --- call tracker.update with all parameters -----------------------------------
 tracks = tracker.update(
-    dets=dets_frame,
+    dets=dets,
     img=img,
     index=frame_num,   
-    embs=embs_frame,
-    geodets=geo_dets_frame
+    embs=embs,
+    geodets=geo_dets
 )
 ```
 
