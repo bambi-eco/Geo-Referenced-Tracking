@@ -1,8 +1,5 @@
-# Mikel Broström 🔥 Yolo Tracking 🧾 AGPL-3.0 license
-# Modified to operate in geo-referenced coordinates
-
 """
-DeepOCSort Geo-Native
+GeoNative DeepOCSort Tracker
 
 This version operates the ENTIRE tracking pipeline in geo-referenced coordinates
 instead of pixel coordinates. Key differences from standard DeepOCSort:
@@ -18,11 +15,14 @@ This approach should provide:
 - More stable tracking (geo coords don't change with camera motion)
 - Better velocity prediction (real-world units are more consistent)
 - Improved association in crowded scenes (geo separates overlapping objects)
+
+Based on the BoxMot Framework by Mikel Broström.
+Modified for geo-referenced wildlife tracking.
 """
 
 from collections import deque
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -31,154 +31,164 @@ from boxmot.appearance.reid.auto_backend import ReidAutoBackend
 from boxmot.motion.cmc import get_cmc_method
 from boxmot.motion.kalman_filters.aabb.xysr_kf import KalmanFilterXYSR
 from boxmot.trackers.basetracker import BaseTracker
-from boxmot.utils.association import associate, linear_assignment
-from boxmot.utils.ops import xyxy2xysr
+from boxmot.utils.association import linear_assignment
 
-from boxmot.utils import logger as LOGGER
+try:
+    from boxmot.utils import logger as LOGGER
+except ImportError:
+    import logging
+    LOGGER = logging.getLogger(__name__)
+
+from .utils import (
+    xyxy2xysr_geo,
+    convert_x_to_bbox_geo,
+    speed_direction_geo,
+    k_previous_obs,
+    geo_iou_batch,
+    geo_giou_batch,
+    parse_geodets_to_boxes,
+)
 
 
 # =============================================================================
-# Geo-Space Utilities
+# Geo-Native Association Function
 # =============================================================================
 
-def xyxy2xysr_geo(bbox: np.ndarray) -> np.ndarray:
+
+def associate_geo(
+    detections: np.ndarray,
+    trackers: np.ndarray,
+    iou_func,
+    iou_threshold: float,
+    velocities: np.ndarray,
+    previous_obs: np.ndarray,
+    vdc_weight: float,
+    emb_cost: Optional[np.ndarray] = None,
+    w_emb: float = 0.5,
+    aw_off: bool = False,
+    aw_param: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Convert [x1, y1, x2, y2] to [cx, cy, area, aspect_ratio] for geo coordinates.
-    Same as pixel version but operates on geo coords.
-    """
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
-    cx = bbox[0] + w / 2.0
-    cy = bbox[1] + h / 2.0
-    area = w * h
-    aspect_ratio = w / h if h > 1e-6 else 1.0
-    return np.array([cx, cy, area, aspect_ratio]).reshape((4, 1))
+    Associate detections to trackers using geo coordinates.
 
-
-def convert_x_to_bbox_geo(x, score=None):
-    """
-    Convert Kalman state [cx, cy, area, aspect_ratio, ...] to [x1, y1, x2, y2].
-    Works for both geo and pixel coordinates.
-    """
-    w = np.sqrt(x[2] * x[3])
-    h = x[2] / w if w > 1e-6 else 0
-    if score is None:
-        return np.array([x[0] - w / 2.0, x[1] - h / 2.0,
-                         x[0] + w / 2.0, x[1] + h / 2.0]).reshape((1, 4))
-    return np.array([x[0] - w / 2.0, x[1] - h / 2.0,
-                     x[0] + w / 2.0, x[1] + h / 2.0, score]).reshape((1, 5))
-
-
-def speed_direction_geo(bbox1, bbox2):
-    """
-    Compute normalized speed direction between two geo bounding boxes.
-    Returns unit vector in direction of motion.
-    """
-    cx1, cy1 = (bbox1[0] + bbox1[2]) / 2.0, (bbox1[1] + bbox1[3]) / 2.0
-    cx2, cy2 = (bbox2[0] + bbox2[2]) / 2.0, (bbox2[1] + bbox2[3]) / 2.0
-    speed = np.array([cy2 - cy1, cx2 - cx1])
-    norm = np.sqrt((cy2 - cy1) ** 2 + (cx2 - cx1) ** 2) + 1e-6
-    return speed / norm
-
-
-def k_previous_obs(observations, cur_age, k):
-    """Get observation from k frames ago."""
-    if len(observations) == 0:
-        return [-1, -1, -1, -1, -1]
-    for i in range(k):
-        dt = k - i
-        if cur_age - dt in observations:
-            return observations[cur_age - dt]
-    max_age = max(observations.keys())
-    return observations[max_age]
-
-
-def geo_iou_batch(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
-    """
-    Compute IoU between two sets of boxes in geo coordinates.
+    This is adapted from the standard associate() function but uses
+    geo-space IoU and velocity calculations.
 
     Args:
-        boxes_a: (M, 4+) array of boxes [x1, y1, x2, y2, ...]
-        boxes_b: (N, 4+) array of boxes [x1, y1, x2, y2, ...]
+        detections: (M, 5) geo detections [x1, y1, x2, y2, score]
+        trackers: (N, 5) geo tracker predictions [x1, y1, x2, y2, 0]
+        iou_func: IoU function (geo_iou_batch or geo_giou_batch)
+        iou_threshold: Minimum IoU for valid match
+        velocities: (N, 2) tracker velocities
+        previous_obs: (N, 5) previous observations for OCR
+        vdc_weight: Velocity direction consistency weight (inertia)
+        emb_cost: (M, N) embedding similarity matrix
+        w_emb: Weight for embedding cost
+        aw_off: Disable adaptive weighting
+        aw_param: Adaptive weighting parameter
 
     Returns:
-        (M, N) IoU matrix
+        matches: (K, 2) array of matched (det_idx, trk_idx) pairs
+        unmatched_dets: (M-K,) array of unmatched detection indices
+        unmatched_trks: (N-K,) array of unmatched tracker indices
     """
-    M = boxes_a.shape[0]
-    N = boxes_b.shape[0]
+    if len(trackers) == 0:
+        return (
+            np.empty((0, 2), dtype=int),
+            np.arange(len(detections)),
+            np.empty((0,), dtype=int),
+        )
+    if len(detections) == 0:
+        return (
+            np.empty((0, 2), dtype=int),
+            np.empty((0,), dtype=int),
+            np.arange(len(trackers)),
+        )
 
-    if M == 0 or N == 0:
-        return np.zeros((M, N), dtype=float)
+    # Compute IoU matrix in geo space
+    iou_matrix = iou_func(detections, trackers)
 
-    # Expand dimensions for broadcasting
-    a = boxes_a[:, :4]  # (M, 4)
-    b = boxes_b[:, :4]  # (N, 4)
+    # Velocity Direction Consistency (VDC) - OCM from OC-SORT
+    # This penalizes matches where detection movement contradicts track velocity
+    if velocities is not None and len(velocities) > 0:
+        det_centers = (detections[:, :2] + detections[:, 2:4]) / 2  # (M, 2)
+        prev_centers = (previous_obs[:, :2] + previous_obs[:, 2:4]) / 2  # (N, 2)
 
-    # Intersection
-    x1 = np.maximum(a[:, 0:1], b[:, 0:1].T)  # (M, N)
-    y1 = np.maximum(a[:, 1:2], b[:, 1:2].T)
-    x2 = np.minimum(a[:, 2:3], b[:, 2:3].T)
-    y2 = np.minimum(a[:, 3:4], b[:, 3:4].T)
+        # Valid previous observations
+        valid_prev = previous_obs[:, 0] >= 0
 
-    inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+        if np.any(valid_prev):
+            # Compute angle consistency
+            Y = det_centers[:, 0:1] - prev_centers[np.newaxis, :, 0]  # (M, N)
+            X = det_centers[:, 1:2] - prev_centers[np.newaxis, :, 1]  # (M, N)
 
-    # Areas
-    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])  # (M,)
-    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])  # (N,)
+            det_angles = np.arctan2(Y, X)  # (M, N)
+            trk_angles = np.arctan2(velocities[:, 0], velocities[:, 1])  # (N,)
 
-    union = area_a[:, np.newaxis] + area_b[np.newaxis, :] - inter
+            angle_diff = np.abs(det_angles - trk_angles[np.newaxis, :])
+            angle_diff = np.minimum(angle_diff, 2 * np.pi - angle_diff)
 
-    iou = np.where(union > 0, inter / union, 0)
-    return iou
+            # Convert to cost (0 = same direction, 1 = opposite)
+            vdc_cost = angle_diff / np.pi
 
+            # Apply only to tracks with valid history
+            vdc_cost[:, ~valid_prev] = 0
 
-def geo_giou_batch(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
-    """
-    Compute Generalized IoU between two sets of boxes.
-    GIoU handles non-overlapping boxes better than IoU.
+            # Combine with IoU (reduce IoU for velocity-inconsistent matches)
+            iou_matrix = iou_matrix - vdc_weight * vdc_cost
 
-    Returns:
-        (M, N) GIoU matrix with values in [-1, 1]
-    """
-    M = boxes_a.shape[0]
-    N = boxes_b.shape[0]
+    # Embedding cost
+    if emb_cost is not None and not aw_off:
+        # Adaptive weighting based on IoU
+        if aw_param > 0:
+            iou_weight = np.clip(iou_matrix, 0, 1)
+            emb_weight = 1 - iou_weight**aw_param
+        else:
+            emb_weight = w_emb
 
-    if M == 0 or N == 0:
-        return np.zeros((M, N), dtype=float)
+        # Combine IoU and embedding (higher is better)
+        combined = iou_matrix + emb_weight * emb_cost
+    else:
+        combined = iou_matrix
 
-    a = boxes_a[:, :4]
-    b = boxes_b[:, :4]
+    # Hungarian assignment (minimize negative combined score)
+    if min(combined.shape) > 0:
+        matched_indices = linear_assignment(-combined)
+    else:
+        matched_indices = np.empty((0, 2), dtype=int)
 
-    # Intersection
-    x1 = np.maximum(a[:, 0:1], b[:, 0:1].T)
-    y1 = np.maximum(a[:, 1:2], b[:, 1:2].T)
-    x2 = np.minimum(a[:, 2:3], b[:, 2:3].T)
-    y2 = np.minimum(a[:, 3:4], b[:, 3:4].T)
+    # Filter matches by threshold
+    unmatched_dets = []
+    unmatched_trks = []
+    matches = []
 
-    inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+    for d in range(len(detections)):
+        if d not in matched_indices[:, 0]:
+            unmatched_dets.append(d)
 
-    # Areas
-    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
-    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
-    union = area_a[:, np.newaxis] + area_b[np.newaxis, :] - inter
+    for t in range(len(trackers)):
+        if t not in matched_indices[:, 1]:
+            unmatched_trks.append(t)
 
-    iou = np.where(union > 0, inter / union, 0)
+    for m in matched_indices:
+        if combined[m[0], m[1]] < iou_threshold:
+            unmatched_dets.append(m[0])
+            unmatched_trks.append(m[1])
+        else:
+            matches.append(m.reshape(1, 2))
 
-    # Enclosing box
-    enc_x1 = np.minimum(a[:, 0:1], b[:, 0:1].T)
-    enc_y1 = np.minimum(a[:, 1:2], b[:, 1:2].T)
-    enc_x2 = np.maximum(a[:, 2:3], b[:, 2:3].T)
-    enc_y2 = np.maximum(a[:, 3:4], b[:, 3:4].T)
+    if len(matches) == 0:
+        matches = np.empty((0, 2), dtype=int)
+    else:
+        matches = np.concatenate(matches, axis=0)
 
-    enc_area = (enc_x2 - enc_x1) * (enc_y2 - enc_y1)
-
-    giou = iou - np.where(enc_area > 0, (enc_area - union) / enc_area, 0)
-    return giou
+    return matches, np.array(unmatched_dets), np.array(unmatched_trks)
 
 
 # =============================================================================
 # Geo-Native Kalman Box Tracker
 # =============================================================================
+
 
 class KalmanBoxTrackerGeoNative:
     """
@@ -194,15 +204,15 @@ class KalmanBoxTrackerGeoNative:
     count = 0
 
     def __init__(
-            self,
-            geo_det: np.ndarray,
-            pixel_det: np.ndarray,
-            delta_t: int = 3,
-            emb: Optional[np.ndarray] = None,
-            alpha: float = 0,
-            max_obs: int = 50,
-            Q_xy_scaling: float = 0.01,
-            Q_s_scaling: float = 0.0001,
+        self,
+        geo_det: np.ndarray,
+        pixel_det: np.ndarray,
+        delta_t: int = 3,
+        emb: Optional[np.ndarray] = None,
+        alpha: float = 0,
+        max_obs: int = 50,
+        Q_xy_scaling: float = 0.01,
+        Q_s_scaling: float = 0.0001,
     ):
         """
         Initialize tracker with geo and pixel detections.
@@ -289,9 +299,9 @@ class KalmanBoxTrackerGeoNative:
         self.frozen = False
 
     def update(
-            self,
-            geo_det: Optional[np.ndarray],
-            pixel_det: Optional[np.ndarray] = None
+        self,
+        geo_det: Optional[np.ndarray],
+        pixel_det: Optional[np.ndarray] = None,
     ):
         """
         Update state with new observation.
@@ -340,15 +350,16 @@ class KalmanBoxTrackerGeoNative:
             self.kf.update(None)
             self.frozen = True
 
-    def update_emb(self, emb, alpha=0.9):
+    def update_emb(self, emb: np.ndarray, alpha: float = 0.9):
         """Update appearance embedding with exponential moving average."""
         self.emb = alpha * self.emb + (1 - alpha) * emb
         self.emb /= np.linalg.norm(self.emb)
 
-    def get_emb(self):
+    def get_emb(self) -> np.ndarray:
+        """Get current appearance embedding."""
         return self.emb
 
-    def apply_affine_correction(self, affine):
+    def apply_affine_correction(self, affine: np.ndarray):
         """
         Apply camera motion compensation.
 
@@ -369,7 +380,7 @@ class KalmanBoxTrackerGeoNative:
         # because it operates in geo coordinates which are invariant to camera motion!
         # This is a key advantage of geo-native tracking.
 
-    def predict(self):
+    def predict(self) -> np.ndarray:
         """
         Advance state and return predicted GEO bounding box.
         """
@@ -388,149 +399,23 @@ class KalmanBoxTrackerGeoNative:
         self.history.append(geo_pred)
         return geo_pred
 
-    def get_state(self):
+    def get_state(self) -> np.ndarray:
         """Return current GEO bounding box estimate."""
         return self.x_to_bbox_func(self.kf.x)
 
-    def get_pixel_state(self):
+    def get_pixel_state(self) -> Optional[np.ndarray]:
         """Return last known pixel bounding box (for output)."""
         return self.last_pixel_box.reshape(1, 4) if self.last_pixel_box is not None else None
 
-    def mahalanobis(self, bbox):
+    def mahalanobis(self, bbox: np.ndarray) -> float:
         """Compute Mahalanobis distance for a GEO bbox measurement."""
         return self.kf.md_for_measurement(self.bbox_to_z_func(bbox))
 
 
 # =============================================================================
-# Geo-Native Association Function
-# =============================================================================
-
-def associate_geo(
-        detections: np.ndarray,
-        trackers: np.ndarray,
-        iou_func,
-        iou_threshold: float,
-        velocities: np.ndarray,
-        previous_obs: np.ndarray,
-        vdc_weight: float,
-        emb_cost: Optional[np.ndarray] = None,
-        w_emb: float = 0.5,
-        aw_off: bool = False,
-        aw_param: float = 0.5,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Associate detections to trackers using geo coordinates.
-
-    This is adapted from the standard associate() function but uses
-    geo-space IoU and velocity calculations.
-
-    Args:
-        detections: (M, 5) geo detections [x1, y1, x2, y2, score]
-        trackers: (N, 5) geo tracker predictions [x1, y1, x2, y2, 0]
-        iou_func: IoU function (geo_iou_batch or geo_giou_batch)
-        iou_threshold: Minimum IoU for valid match
-        velocities: (N, 2) tracker velocities
-        previous_obs: (N, 5) previous observations for OCR
-        vdc_weight: Velocity direction consistency weight (inertia)
-        emb_cost: (M, N) embedding similarity matrix
-        w_emb: Weight for embedding cost
-        aw_off: Disable adaptive weighting
-        aw_param: Adaptive weighting parameter
-
-    Returns:
-        matches: (K, 2) array of matched (det_idx, trk_idx) pairs
-        unmatched_dets: (M-K,) array of unmatched detection indices
-        unmatched_trks: (N-K,) array of unmatched tracker indices
-    """
-    if len(trackers) == 0:
-        return np.empty((0, 2), dtype=int), np.arange(len(detections)), np.empty((0,), dtype=int)
-    if len(detections) == 0:
-        return np.empty((0, 2), dtype=int), np.empty((0,), dtype=int), np.arange(len(trackers))
-
-    # Compute IoU matrix in geo space
-    iou_matrix = iou_func(detections, trackers)
-
-    # Velocity Direction Consistency (VDC) - OCM from OC-SORT
-    # This penalizes matches where detection movement contradicts track velocity
-    if velocities is not None and len(velocities) > 0:
-        det_centers = (detections[:, :2] + detections[:, 2:4]) / 2  # (M, 2)
-        trk_centers = (trackers[:, :2] + trackers[:, 2:4]) / 2  # (N, 2)
-        prev_centers = (previous_obs[:, :2] + previous_obs[:, 2:4]) / 2  # (N, 2)
-
-        # Valid previous observations
-        valid_prev = previous_obs[:, 0] >= 0
-
-        if np.any(valid_prev):
-            # Compute angle consistency
-            Y = det_centers[:, 0:1] - prev_centers[np.newaxis, :, 0]  # (M, N)
-            X = det_centers[:, 1:2] - prev_centers[np.newaxis, :, 1]  # (M, N)
-
-            det_angles = np.arctan2(Y, X)  # (M, N)
-            trk_angles = np.arctan2(velocities[:, 0], velocities[:, 1])  # (N,)
-
-            angle_diff = np.abs(det_angles - trk_angles[np.newaxis, :])
-            angle_diff = np.minimum(angle_diff, 2 * np.pi - angle_diff)
-
-            # Convert to cost (0 = same direction, 1 = opposite)
-            vdc_cost = angle_diff / np.pi
-
-            # Apply only to tracks with valid history
-            vdc_cost[:, ~valid_prev] = 0
-
-            # Combine with IoU (reduce IoU for velocity-inconsistent matches)
-            iou_matrix = iou_matrix - vdc_weight * vdc_cost
-
-    # Embedding cost
-    if emb_cost is not None and not aw_off:
-        # Adaptive weighting based on IoU
-        if aw_param > 0:
-            iou_weight = np.clip(iou_matrix, 0, 1)
-            emb_weight = 1 - iou_weight ** aw_param
-        else:
-            emb_weight = w_emb
-
-        # Combine IoU and embedding (higher is better)
-        combined = iou_matrix + emb_weight * emb_cost
-    else:
-        combined = iou_matrix
-
-    # Hungarian assignment (minimize negative combined score)
-    if min(combined.shape) > 0:
-        matched_indices = linear_assignment(-combined)
-    else:
-        matched_indices = np.empty((0, 2), dtype=int)
-
-    # Filter matches by threshold
-    unmatched_dets = []
-    unmatched_trks = []
-    matches = []
-
-    for d in range(len(detections)):
-        if d not in matched_indices[:, 0]:
-            unmatched_dets.append(d)
-
-    for t in range(len(trackers)):
-        if t not in matched_indices[:, 1]:
-            unmatched_trks.append(t)
-
-    for m in matched_indices:
-        if combined[m[0], m[1]] < iou_threshold:
-            unmatched_dets.append(m[0])
-            unmatched_trks.append(m[1])
-        else:
-            matches.append(m.reshape(1, 2))
-
-    if len(matches) == 0:
-        matches = np.empty((0, 2), dtype=int)
-    else:
-        matches = np.concatenate(matches, axis=0)
-
-    return matches, np.array(unmatched_dets), np.array(unmatched_trks)
-
-
-# =============================================================================
 # Main Tracker Class
 # =============================================================================
+
 
 class GeoNativeDeepOcSort(BaseTracker):
     """
@@ -549,37 +434,67 @@ class GeoNativeDeepOcSort(BaseTracker):
     """
 
     def __init__(
-            self,
-            reid_weights: Path,
-            device: torch.device,
-            half: bool,
-            # BaseTracker parameters
-            det_thresh: float = 0.3,
-            max_age: int = 50,
-            max_obs: int = 50,
-            min_hits: int = 3,
-            iou_threshold: float = 0.2,
-            per_class: bool = False,
-            nr_classes: int = 80,
-            asso_func: str = "giou",  # Default to GIoU for geo space
-            is_obb: bool = False,
-            # DeepOcSort-specific parameters
-            delta_t: int = 3,
-            inertia: float = 0.25,
-            w_association_emb: float = 0.5,
-            alpha_fixed_emb: float = 0.95,
-            aw_param: float = 0.5,
-            use_embs: bool = False,
-            cmc_off: bool = True,  # CMC is off by default in geo mode
-            aw_off: bool = False,
-            Q_xy_scaling: float = 0.01,
-            Q_s_scaling: float = 0.0001,
-            # Geo-specific parameters
-            use_giou: bool = True,  # Use GIoU instead of IoU
-            ocr_iou_threshold: float = 0.15,  # Separate threshold for OCR stage
-            geo_referenced: bool = True,
-            **kwargs
+        self,
+        reid_weights: Path,
+        device: torch.device,
+        half: bool,
+        # BaseTracker parameters
+        det_thresh: float = 0.3,
+        max_age: int = 50,
+        max_obs: int = 50,
+        min_hits: int = 3,
+        iou_threshold: float = 0.2,
+        per_class: bool = False,
+        nr_classes: int = 80,
+        asso_func: str = "giou",  # Default to GIoU for geo space
+        is_obb: bool = False,
+        # DeepOcSort-specific parameters
+        delta_t: int = 3,
+        inertia: float = 0.25,
+        w_association_emb: float = 0.5,
+        alpha_fixed_emb: float = 0.95,
+        aw_param: float = 0.5,
+        use_embs: bool = False,
+        cmc_off: bool = True,  # CMC is off by default in geo mode
+        aw_off: bool = False,
+        Q_xy_scaling: float = 0.01,
+        Q_s_scaling: float = 0.0001,
+        # Geo-specific parameters
+        use_giou: bool = True,  # Use GIoU instead of IoU
+        ocr_iou_threshold: float = 0.15,  # Separate threshold for OCR stage
+        geo_referenced: bool = True,
+        **kwargs,
     ):
+        """
+        Initialize the GeoNative DeepOCSort tracker.
+
+        Args:
+            reid_weights: Path to ReID model weights
+            device: Torch device for inference
+            half: Use half precision for ReID model
+            det_thresh: Detection confidence threshold
+            max_age: Maximum frames to keep track alive without detection
+            max_obs: Maximum observations to store per track
+            min_hits: Minimum hits before track is confirmed
+            iou_threshold: IoU threshold for association
+            per_class: Track objects per class
+            nr_classes: Number of classes
+            asso_func: Association function name
+            is_obb: Use oriented bounding boxes
+            delta_t: Time window for velocity estimation
+            inertia: Velocity direction consistency weight
+            w_association_emb: Embedding weight in association
+            alpha_fixed_emb: Fixed component of embedding update rate
+            aw_param: Adaptive weighting parameter
+            use_embs: Use appearance embeddings
+            cmc_off: Disable camera motion compensation
+            aw_off: Disable adaptive weighting
+            Q_xy_scaling: Kalman filter position noise scaling
+            Q_s_scaling: Kalman filter scale noise scaling
+            use_giou: Use GIoU instead of standard IoU
+            ocr_iou_threshold: IoU threshold for OCR stage
+            geo_referenced: Enable geo-referenced tracking (should be True)
+        """
         super().__init__(
             det_thresh=det_thresh,
             max_age=max_age,
@@ -590,7 +505,7 @@ class GeoNativeDeepOcSort(BaseTracker):
             nr_classes=nr_classes,
             asso_func=asso_func,
             is_obb=is_obb,
-            **kwargs
+            **kwargs,
         )
 
         # Standard parameters
@@ -609,14 +524,14 @@ class GeoNativeDeepOcSort(BaseTracker):
         self.Q_s_scaling = Q_s_scaling
 
         # OCR threshold (can be lower than main threshold)
-        self.ocr_iou_threshold = ocr_iou_threshold if ocr_iou_threshold is not None else iou_threshold
+        self.ocr_iou_threshold = (
+            ocr_iou_threshold if ocr_iou_threshold is not None else iou_threshold
+        )
 
         KalmanBoxTrackerGeoNative.count = 1
 
         # ReID model for appearance
-        self.model = ReidAutoBackend(
-            weights=reid_weights, device=device, half=half
-        ).model
+        self.model = ReidAutoBackend(weights=reid_weights, device=device, half=half).model
 
         # CMC - disabled by default for geo-native (geo coords are stable)
         self.cmc_off = cmc_off
@@ -632,40 +547,27 @@ class GeoNativeDeepOcSort(BaseTracker):
         self.use_giou = use_giou
         self.iou_func = geo_giou_batch if use_giou else geo_iou_batch
 
-        LOGGER.success(f"Initialized DeepOcSortGeoNative (giou={use_giou}, cmc_off={cmc_off})")
+        if hasattr(LOGGER, "success"):
+            LOGGER.success(f"Initialized GeoNativeDeepOcSort (giou={use_giou}, cmc_off={cmc_off})")
 
-    def _parse_geodets(
-            self,
-            geodets: np.ndarray
-    ) -> np.ndarray:
+    def _parse_geodets(self, geodets: np.ndarray) -> np.ndarray:
         """
         Convert geodets format to simple [x1, y1, x2, y2, score] array.
 
         Input format: [source_id, frame_id, x1, y1, z1, x2, y2, z2, conf, cls]
         Output format: [x1, y1, x2, y2, score]
         """
-        if geodets is None or len(geodets) == 0:
-            return None
-
-        geo_boxes = np.column_stack([
-            geodets[:, 2],  # x1
-            geodets[:, 3],  # y1
-            geodets[:, 5],  # x2
-            geodets[:, 6],  # y2
-            geodets[:, 8],  # conf
-        ]).astype(float)
-
-        return geo_boxes
+        return parse_geodets_to_boxes(geodets)
 
     @BaseTracker.setup_decorator
     @BaseTracker.per_class_decorator
     def update(
-            self,
-            dets: np.ndarray,
-            img: np.ndarray,
-            index: int,
-            embs: np.ndarray = None,
-            geodets: np.ndarray = None,
+        self,
+        dets: np.ndarray,
+        img: np.ndarray,
+        index: int,
+        embs: np.ndarray = None,
+        geodets: np.ndarray = None,
     ) -> np.ndarray:
         """
         Process one frame with geo-native tracking.
@@ -687,13 +589,16 @@ class GeoNativeDeepOcSort(BaseTracker):
 
         # === Validate geo detections ===
         if geodets is None or len(geodets) == 0:
-            LOGGER.warning(f"Frame {index}: No geo detections provided, skipping")
+            if hasattr(LOGGER, "warning"):
+                LOGGER.warning(f"Frame {index}: No geo detections provided, skipping")
             # Age all tracks
             for trk in self.active_tracks:
                 trk.predict()
                 trk.update(None)
             # Remove dead tracks
-            self.active_tracks = [t for t in self.active_tracks if t.time_since_update <= self.max_age]
+            self.active_tracks = [
+                t for t in self.active_tracks if t.time_since_update <= self.max_age
+            ]
             return np.array([])
 
         # === Filter by confidence ===
@@ -713,7 +618,9 @@ class GeoNativeDeepOcSort(BaseTracker):
             for trk in self.active_tracks:
                 trk.predict()
                 trk.update(None)
-            self.active_tracks = [t for t in self.active_tracks if t.time_since_update <= self.max_age]
+            self.active_tracks = [
+                t for t in self.active_tracks if t.time_since_update <= self.max_age
+            ]
             return np.array([])
 
         # === Extract appearance embeddings (using PIXEL boxes) ===
@@ -759,15 +666,19 @@ class GeoNativeDeepOcSort(BaseTracker):
             self.active_tracks.pop(t)
 
         # Get velocities and previous observations (all in GEO space)
-        velocities = np.array([
-            trk.velocity if trk.velocity is not None else np.array((0, 0))
-            for trk in self.active_tracks
-        ])
+        velocities = np.array(
+            [
+                trk.velocity if trk.velocity is not None else np.array((0, 0))
+                for trk in self.active_tracks
+            ]
+        )
         last_boxes = np.array([trk.last_observation for trk in self.active_tracks])
-        k_observations = np.array([
-            k_previous_obs(trk.observations, trk.age, self.delta_t)
-            for trk in self.active_tracks
-        ])
+        k_observations = np.array(
+            [
+                k_previous_obs(trk.observations, trk.age, self.delta_t)
+                for trk in self.active_tracks
+            ]
+        )
 
         # =====================================================================
         # Stage 1: Primary association (GEO IoU + Embedding + Velocity)
@@ -881,12 +792,12 @@ class GeoNativeDeepOcSort(BaseTracker):
                 d = trk.pixel_box
 
             if (trk.time_since_update < 1) and (
-                    trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits
+                trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits
             ):
                 ret.append(
-                    np.concatenate(
-                        (d, [trk.id], [trk.conf], [trk.cls], [trk.det_ind])
-                    ).reshape(1, -1)
+                    np.concatenate((d, [trk.id], [trk.conf], [trk.cls], [trk.det_ind])).reshape(
+                        1, -1
+                    )
                 )
 
             i -= 1
