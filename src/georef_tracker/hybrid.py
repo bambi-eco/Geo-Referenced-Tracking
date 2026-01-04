@@ -646,7 +646,7 @@ class GeoHybridDeepOcSort(BaseTracker):
         self,
         dets: np.ndarray,
         img: np.ndarray,
-        index: int,
+        index: int = None,
         embs: np.ndarray = None,
         geodets: np.ndarray = None,
     ) -> np.ndarray:
@@ -656,14 +656,20 @@ class GeoHybridDeepOcSort(BaseTracker):
         Args:
             dets: (N, >=5) Pixel detections [x1, y1, x2, y2, score, (cls)]
             img: Current frame image
-            index: Frame index
+            index: Frame index (or read from self._current_frame_index for BoxMOT v16+ compatibility)
             embs: Optional pre-computed embeddings
-            geodets: (N, 10) Geo detections
+            geodets: (N, 10) Geo detections (or read from self._current_geodets for BoxMOT v16+ compatibility)
                      [source_id, frame_id, x1, y1, z1, x2, y2, z2, conf, cls]
 
         Returns:
             (M, 8) array: [x1, y1, x2, y2, track_id, conf, cls, det_ind]
         """
+        # BoxMOT v16+ compatibility: read from instance attributes if parameters stripped by decorator
+        if index is None:
+            index = getattr(self, '_current_frame_index', self.frame_count)
+        if geodets is None:
+            geodets = getattr(self, '_current_geodets', None)
+        
         self.check_inputs(dets, img)
 
         self.frame_count += 1
