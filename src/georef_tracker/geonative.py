@@ -560,7 +560,6 @@ class GeoNativeDeepOcSort(BaseTracker):
         return parse_geodets_to_boxes(geodets)
 
     @BaseTracker.setup_decorator
-    @BaseTracker.per_class_decorator
     def update(
         self,
         dets: np.ndarray,
@@ -575,15 +574,15 @@ class GeoNativeDeepOcSort(BaseTracker):
         Args:
             dets: (N, >=5) Pixel detections [x1, y1, x2, y2, score, (cls)]
             img: Current frame image (for embedding extraction)
-            index: Frame index (or read from self._current_frame_index for BoxMOT v16+ compatibility)
+            index: Frame index (optional - falls back to self._current_frame_index or frame_count)
             embs: Optional pre-computed embeddings
-            geodets: (N, 10) Geo detections (or read from self._current_geodets for BoxMOT v16+ compatibility)
+            geodets: (N, 10) Geo detections (optional - falls back to self._current_geodets)
                      [source_id, frame_id, x1, y1, z1, x2, y2, z2, conf, cls]
 
         Returns:
             (M, 8) array: [x1, y1, x2, y2, track_id, conf, cls, det_ind] in PIXEL coords
         """
-        # BoxMOT v16+ compatibility: read from instance attributes if parameters stripped by decorator
+        # Support both direct parameters and instance attributes (for BoxMOT v16+ compatibility)
         if index is None:
             index = getattr(self, '_current_frame_index', self.frame_count)
         if geodets is None:
