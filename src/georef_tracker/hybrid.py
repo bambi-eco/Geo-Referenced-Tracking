@@ -640,7 +640,6 @@ class GeoHybridDeepOcSort(BaseTracker):
 
         return geo_boxes, geodets
 
-    @BaseTracker.setup_decorator
     def update(
         self,
         dets: np.ndarray,
@@ -668,6 +667,10 @@ class GeoHybridDeepOcSort(BaseTracker):
             index = getattr(self, '_current_frame_index', self.frame_count)
         if geodets is None:
             geodets = getattr(self, '_current_geodets', None)
+        
+        # Handle empty detections (replaces @setup_decorator functionality)
+        if dets is None or len(dets) == 0:
+            dets = np.empty((0, 6))
         
         self.check_inputs(dets, img)
 
